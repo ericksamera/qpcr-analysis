@@ -1,0 +1,1905 @@
+=== Diff vs. origin ===
+
+=== Unstaged Changes ===
+
+=== Staged Changes ===
+
+=== Untracked Files ===
+
+--- a.diff (new file) ---
+diff --git a/a.diff b/a.diff
+new file mode 100755
+index 0000000..d3dc955
+--- /dev/null
++++ b/a.diff
+@@ -0,0 +1,9 @@
++=== Diff vs. origin ===
++
++=== Unstaged Changes ===
++
++=== Staged Changes ===
++
++=== Untracked Files ===
++
++--- a.diff (new file) ---
+
+--- ddct_pipeline/__init__.py (new file) ---
+diff --git a/ddct_pipeline/__init__.py b/ddct_pipeline/__init__.py
+new file mode 100755
+index 0000000..cabd2be
+--- /dev/null
++++ b/ddct_pipeline/__init__.py
+@@ -0,0 +1 @@
++# ddct_pipeline/__init__.py
+\ No newline at end of file
+
+--- ddct_pipeline/converters.py (new file) ---
+diff --git a/ddct_pipeline/converters.py b/ddct_pipeline/converters.py
+new file mode 100755
+index 0000000..b488d17
+--- /dev/null
++++ b/ddct_pipeline/converters.py
+@@ -0,0 +1,111 @@
++# ddct_pipeline/converters.py
++
++import pandas as pd
++from ddct_pipeline.types import CtRow
++import numpy as np
++
++def df_to_rows(df: pd.DataFrame) -> list[CtRow]:
++    return [
++        CtRow(
++            sample_id=row["sample_id"],
++            gene=row["gene"],
++            ct=row["ct"],
++            metadata={k: row[k] for k in row.index if k not in {"sample_id", "gene", "ct"}}
++        )
++        for _, row in df.iterrows()
++    ]
++
++def rows_to_df(rows: list[CtRow]) -> pd.DataFrame:
++    data = []
++    for r in rows:
++        base = {
++            "sample_id": r.sample_id,
++            "gene": r.gene,
++            "ct": r.ct  # <- could be tuple
++        }
++        base.update(r.metadata)
++        data.append(base)
++    return pd.DataFrame(data)
++
++def df_to_rows(df: pd.DataFrame) -> list[CtRow]:
++    return [
++        CtRow(
++            sample_id=row["sample_id"],
++            gene=row["gene"],
++            ct=row["ct"],
++            metadata={k: row[k] for k in row.index if k not in {"sample_id", "gene", "ct"}}
++        )
++        for _, row in df.iterrows()
++    ]
++
++def rows_to_df(rows: list[CtRow]) -> pd.DataFrame:
++    data = []
++    for r in rows:
++        base = {
++            "sample_id": r.sample_id,
++            "gene": r.gene,
++            "ct": r.ct
++        }
++        base.update(r.metadata)
++        data.append(base)
++    return pd.DataFrame(data)
++
++# --- NEW Excel parser utils ---
++
++EXPECTED_COLUMNS = {
++    "sample name": "sample_id",
++    "target name": "gene",
++    "ct": "ct"
++}
++
++def parse_excel_ct_file(file) -> pd.DataFrame:
++    """Parse and clean Ct data from a single Excel file."""
++    raw = pd.read_excel(file, sheet_name="Results", header=None)
++
++    header_row_idx = None
++    for i, row in raw.iterrows():
++        row_vals = row.astype(str).str.lower().str.strip().tolist()
++        if "sample name" in row_vals and "target name" in row_vals:
++            header_row_idx = i
++            break
++
++    if header_row_idx is None:
++        raise ValueError("Could not find header row.")
++
++    df = pd.read_excel(file, sheet_name="Results", header=header_row_idx)
++    df.columns = df.columns.str.strip().str.lower()
++
++    if not all(col in df.columns for col in EXPECTED_COLUMNS):
++        missing = [col for col in EXPECTED_COLUMNS if col not in df.columns]
++        raise ValueError(f"Missing required columns: {missing}")
++
++    df = df[list(EXPECTED_COLUMNS.keys())].rename(columns=EXPECTED_COLUMNS)
++    df["ct"] = pd.to_numeric(df["ct"], errors="coerce")
++    df = df.dropna(subset=["sample_id", "gene", "ct"])
++    df = df[df["ct"].apply(lambda x: isinstance(x, (int, float)))]
++    df["source_file"] = file.name
++    df["original_sample_id"] = df["sample_id"]
++
++    return df
++
++
++def collapse_replicates(df: pd.DataFrame) -> pd.DataFrame:
++    """Collapse technical replicates and compute mean Ct."""
++    grouped = df.groupby(["sample_id", "gene", "source_file", "original_sample_id"])
++    collapsed = []
++
++    for (sid, gene, src, orig), group in grouped:
++        ct_vals = tuple(round(v, 2) for v in group["ct"].tolist())
++        ct_mean = round(np.mean(ct_vals), 2)
++
++        collapsed.append({
++            "Sample ID": sid,
++            "Gene": gene,
++            "Ct": ct_mean,
++            "Replicates": list(ct_vals),
++            "n": len(ct_vals),
++            "Original Sample ID": orig,
++            "Source File": src
++        })
++
++    return pd.DataFrame(collapsed)
+
+--- ddct_pipeline/models.py (new file) ---
+diff --git a/ddct_pipeline/models.py b/ddct_pipeline/models.py
+new file mode 100755
+index 0000000..9c38319
+--- /dev/null
++++ b/ddct_pipeline/models.py
+@@ -0,0 +1,17 @@
++# ddct_pipeline/models.py
++
++from dataclasses import dataclass
++from typing import List
++
++@dataclass
++class CtRow:
++    sample_id: str
++    gene: str
++    ct: float  # ✅ always averaged
++    metadata: dict[str, str]
++
++
++@dataclass
++class GroupingVariable:
++    name: str
++    acceptable_values: List[str]
+\ No newline at end of file
+
+--- ddct_pipeline/processor.py (new file) ---
+diff --git a/ddct_pipeline/processor.py b/ddct_pipeline/processor.py
+new file mode 100755
+index 0000000..e43c5e9
+--- /dev/null
++++ b/ddct_pipeline/processor.py
+@@ -0,0 +1,51 @@
++import pandas as pd
++import numpy as np
++
++from interface.backend.session_schema import ExperimentConfig
++from ddct_pipeline.types import CtRow
++
++def geo_mean(series):
++    series = pd.to_numeric(series, errors="coerce")
++    series = series[series > 0]  # filter out non-positive values
++    return np.exp(np.mean(np.log(series))) if not series.empty else np.nan
++
++
++def process_ddct(rows: list[CtRow], config: ExperimentConfig) -> pd.DataFrame:
++    # Convert CtRows to DataFrame
++    df = pd.DataFrame([{
++        "sample_id": r.sample_id,
++        "gene": r.gene,
++        "ct": geo_mean(r.ct) if isinstance(r.ct, (tuple, list)) else r.ct,
++        **r.metadata
++    } for r in rows])
++
++    df["ct"] = pd.to_numeric(df["ct"], errors="coerce")
++    df = df[df["ct"] > 0]  # geometric mean requires positive values
++
++    # Step 1: Average technical replicates using geometric mean
++    metadata_keys = [k for k in df.columns if k not in {"sample_id", "gene", "ct"}]
++
++    df["n"] = 1  # replicate count
++    df = df.groupby(["sample_id", "gene"], as_index=False).agg({
++        "ct": geo_mean,
++        "n": "count",
++        **{k: "first" for k in metadata_keys}
++    })
++
++    # Step 2: ΔCt = Ct - refCt
++    ref_genes = config["reference_genes"]
++    ref_cts = df[df["gene"].isin(ref_genes)].groupby("sample_id")["ct"].apply(geo_mean).rename("ref_ct")
++    df = df.join(ref_cts, on="sample_id")
++    df["ΔCt"] = df["ct"] - df["ref_ct"]
++
++    # Step 3: ΔΔCt = ΔCt - ref(ΔCt)
++    ref_cond = config["reference_condition"]
++    grouping_var = config["grouping_variables"][0].name
++    ref_means = df[df[grouping_var] == ref_cond].groupby("gene")["ΔCt"].mean().rename("ΔCt_ref")
++    df = df.join(ref_means, on="gene")
++    df["ΔΔCt"] = df["ΔCt"] - df["ΔCt_ref"]
++
++    # Step 4: Fold change
++    df["Fold Change"] = 2 ** (-df["ΔΔCt"])
++
++    return df
+
+--- ddct_pipeline/types.py (new file) ---
+diff --git a/ddct_pipeline/types.py b/ddct_pipeline/types.py
+new file mode 100755
+index 0000000..856bb51
+--- /dev/null
++++ b/ddct_pipeline/types.py
+@@ -0,0 +1,16 @@
++# ddct_pipeline/types.py
++
++from dataclasses import dataclass
++from typing import List, Dict
++
++@dataclass
++class CtRow:
++    sample_id: str
++    gene: str
++    ct: float
++    metadata: Dict[str, str]
++
++@dataclass
++class GroupingVariable:
++    name: str
++    values: List[str]
+
+--- ddct_pipeline/validators.py (new file) ---
+diff --git a/ddct_pipeline/validators.py b/ddct_pipeline/validators.py
+new file mode 100755
+index 0000000..ed1b5d9
+--- /dev/null
++++ b/ddct_pipeline/validators.py
+@@ -0,0 +1,22 @@
++# ddct_pipeline/validators.py
++import pandas as pd
++
++def validate_rows(rows, config) -> list[str]:
++    errors = []
++    genes = set(r.gene for r in rows)
++    samples = set(r.sample_id for r in rows)
++
++    for ref_gene in config["reference_genes"]:
++        if ref_gene not in genes:
++            errors.append(f"Missing reference gene: {ref_gene}")
++
++    ref_cond = config["reference_condition"]
++    grouping_var = config["grouping_variables"][0].name
++    if ref_cond not in config["groups"].get(grouping_var, []):
++        errors.append(f"Reference condition '{ref_cond}' not found in group '{grouping_var}'")
++
++    for row in rows:
++        if row.ct is None or pd.isna(row.ct):
++            errors.append(f"Missing Ct value for sample '{row.sample_id}', gene '{row.gene}'")
++
++    return errors
+
+--- interface/__init__.py (new file) ---
+diff --git a/interface/__init__.py b/interface/__init__.py
+new file mode 100755
+index 0000000..0774c31
+--- /dev/null
++++ b/interface/__init__.py
+@@ -0,0 +1 @@
++# interface/__init__.py
+\ No newline at end of file
+
+--- interface/backend/__init__.py (new file) ---
+diff --git a/interface/backend/__init__.py b/interface/backend/__init__.py
+new file mode 100755
+index 0000000..034aac5
+--- /dev/null
++++ b/interface/backend/__init__.py
+@@ -0,0 +1 @@
++# interface/backend/__init__.py
+\ No newline at end of file
+
+--- interface/backend/session.py (new file) ---
+diff --git a/interface/backend/session.py b/interface/backend/session.py
+new file mode 100755
+index 0000000..c3e6cf9
+--- /dev/null
++++ b/interface/backend/session.py
+@@ -0,0 +1,20 @@
++# interface/backend/session.py
++
++import streamlit as st
++
++def initialize_session_state():
++    defaults = {
++        "experiment_config": {
++            "genes": [],
++            "reference_genes": [],
++            "grouping_variables": [],
++            "reference_grouping": "",
++            "reference_condition": "",
++            "groups": {}
++        },
++        "grouping_variables": [],
++    }
++
++    for key, value in defaults.items():
++        if key not in st.session_state:
++            st.session_state[key] = value
+
+--- interface/backend/session_io.py (new file) ---
+diff --git a/interface/backend/session_io.py b/interface/backend/session_io.py
+new file mode 100755
+index 0000000..185fb99
+--- /dev/null
++++ b/interface/backend/session_io.py
+@@ -0,0 +1,92 @@
++# interface/backend/session_io.py
++
++import json
++import streamlit as st
++from typing import Any, Dict
++from ddct_pipeline.types import CtRow, GroupingVariable
++from ddct_pipeline.converters import rows_to_df, df_to_rows
++
++from interface.backend.session_schema import ExperimentConfig
++
++# --- Core Session State Keys ---
++STATE_KEYS = {
++    "experiment_config",
++    "grouping_variables",
++    "ct_data_df",
++    "ddct_results_df"
++}
++
++def serialize_session() -> Dict[str, Any]:
++    """Convert session state to a JSON-safe dict."""
++    config = st.session_state.get("experiment_config", {})
++    grouping_vars = [
++        gv.__dict__ if isinstance(gv, GroupingVariable) else gv
++        for gv in config.get("grouping_variables", [])
++    ]
++    config["grouping_variables"] = grouping_vars
++
++    session = {
++        "experiment_config": config,
++        "ct_rows": [r.__dict__ for r in df_to_rows(st.session_state.get("ct_data_df", rows_to_df([])))],
++    }
++    return session
++
++
++def deserialize_session(data: Dict[str, Any]):
++    """Restore session state from a previously exported session dict."""
++
++
++    config: ExperimentConfig = data.get("experiment_config", {})
++
++    if "grouping_variables" in config:
++        config["grouping_variables"] = [
++            GroupingVariable(**gv) if isinstance(gv, dict) else gv
++            for gv in config["grouping_variables"]
++        ]
++    st.session_state["experiment_config"] = config
++
++    ct_rows = [CtRow(**r) for r in data.get("ct_rows", [])]
++    st.session_state["ct_data_df"] = rows_to_df(ct_rows)
++    st.toast("Session imported.", icon="📥")
++    st.rerun()
++
++
++def session_export_button():
++    if st.button("Export", use_container_width=True):
++        session_data = serialize_session()
++        st.download_button(
++            label="Download JSON",
++            data=json.dumps(session_data, indent=2),
++            file_name="ddct_session.json",
++            mime="application/json",
++            use_container_width=True
++        )
++
++
++@st.dialog("Import Session")
++def session_import_dialog():
++    uploaded = st.file_uploader("Upload session JSON", type="json")
++    if uploaded:
++        try:
++            data = json.load(uploaded)
++            deserialize_session(data)
++        except Exception as e:
++            st.error(f"Failed to load session: {e}")
++
++
++def session_import_button():
++    if st.button("Import", use_container_width=True):
++        session_import_dialog()
++
++
++@st.dialog("Restart Session")
++def session_restart_dialog():
++    st.error("This will clear all session data.")
++    if st.button("Confirm Reset", type="primary"):
++        st.session_state.clear()
++        st.rerun()
++
++
++def session_restart_button():
++    if st.button("", type='primary', icon=":material/restart_alt:", use_container_width=True):
++        session_restart_dialog()
+
+--- interface/backend/session_schema.py (new file) ---
+diff --git a/interface/backend/session_schema.py b/interface/backend/session_schema.py
+new file mode 100755
+index 0000000..46b4c2c
+--- /dev/null
++++ b/interface/backend/session_schema.py
+@@ -0,0 +1,12 @@
++# interface/backend/session_schema.py
++
++from typing import TypedDict
++from ddct_pipeline.types import GroupingVariable
++
++class ExperimentConfig(TypedDict):
++    genes: list[str]
++    reference_genes: list[str]
++    grouping_variables: list[GroupingVariable]
++    reference_grouping: str
++    reference_condition: str
++    groups: dict[str, list[str]]
+
+--- interface/components/__init__.py (new file) ---
+diff --git a/interface/components/__init__.py b/interface/components/__init__.py
+new file mode 100755
+index 0000000..b3bb5ed
+--- /dev/null
++++ b/interface/components/__init__.py
+@@ -0,0 +1 @@
++# interface/components/__init__.py
+\ No newline at end of file
+
+--- interface/components/excel_dialog.py (new file) ---
+diff --git a/interface/components/excel_dialog.py b/interface/components/excel_dialog.py
+new file mode 100755
+index 0000000..e54542e
+--- /dev/null
++++ b/interface/components/excel_dialog.py
+@@ -0,0 +1,21 @@
++# interface/components/excel_dialog.py
++
++import streamlit as st
++import pandas as pd
++import numpy as np
++
++@st.dialog("Import Ct Excel Files", width="large")
++def show_excel_import_dialog():
++    uploaded = st.file_uploader(
++        "Upload exported Excel files (.xls/.xlsx)",
++        type=["xls", "xlsx"],
++        accept_multiple_files=True,
++    )
++
++    if uploaded:
++        st.session_state["uploaded_excel_files"] = uploaded
++        st.success(f"{len(uploaded)} file(s) stored for import.")
++
++    if st.button("Confirm upload"):
++        st.session_state["excel_upload_complete"] = True
++        st.rerun()
+
+--- interface/data_entry.py (new file) ---
+diff --git a/interface/data_entry.py b/interface/data_entry.py
+new file mode 100755
+index 0000000..cd544cb
+--- /dev/null
++++ b/interface/data_entry.py
+@@ -0,0 +1,101 @@
++# interface/data_entry.py
++
++import streamlit as st
++import pandas as pd
++
++from ddct_pipeline.processor import process_ddct
++from ddct_pipeline.converters import df_to_rows
++
++def run():
++    st.title("Assign Sample Metadata")
++
++    df = st.session_state.get("ct_data_df")
++    config = st.session_state.get("experiment_config")
++
++    if df is None or df.empty:
++        st.warning("No Ct data available. Please import data first.")
++        return
++
++    grouping_vars = config.get("grouping_variables", [])
++    if not grouping_vars:
++        st.info("No grouping variables configured.")
++        return
++
++    # Group by sample → list genes per sample
++    sample_genes = df.groupby("Sample ID")["Gene"].unique().apply(list)
++
++    rows = []
++    for sample_id, genes in sample_genes.items():
++        row = {"Sample ID": sample_id, "Genes": ", ".join(genes)}
++        # Include placeholders for each grouping variable
++        for gv in grouping_vars:
++            if gv.name == "Samples":
++                row[gv.name] = sample_id  # assign default automatically
++            else:
++                row[gv.name] = st.session_state.get("sample_metadata", {}).get(sample_id, {}).get(gv.name, "")
++
++        rows.append(row)
++
++    editor_df = pd.DataFrame(rows)
++
++    # --- Column config for grouping variables ---
++    column_config = {
++        "Genes": st.column_config.Column(disabled=True),
++    }
++    for gv in grouping_vars:
++        if gv.name == "Samples":
++            continue  # hide from UI
++        column_config[gv.name] = st.column_config.SelectboxColumn(
++            label=gv.name,
++            options=gv.values,
++            required=True
++        )
++
++
++    st.markdown("### Edit grouping metadata per sample")
++
++    edited = st.data_editor(
++        editor_df,
++        use_container_width=True,
++        column_config=column_config,
++        column_order=["Sample ID", "Genes"] + [g.name for g in grouping_vars if g.name != "Samples"],
++        disabled=["Sample ID", "Genes"],
++        hide_index=True
++    )
++
++    if st.button("💾 Save Metadata"):
++        sample_meta = {}
++        for _, row in edited.iterrows():
++            sid = row["Sample ID"]
++            sample_meta[sid] = {gv.name: row[gv.name] for gv in grouping_vars}
++        st.session_state["sample_metadata"] = sample_meta
++        st.toast("Sample metadata updated.", icon="✅")
++
++
++
++    if st.button("Run ΔΔCt Analysis", type="primary"):
++        df = st.session_state.get("ct_data_df").copy()
++
++        # Rename expected fields
++        df = df.rename(columns={
++            "Sample ID": "sample_id",
++            "Gene": "gene",
++            "Ct": "ct"
++        })
++
++        # Ensure 'ct' is numeric
++        df["ct"] = pd.to_numeric(df["ct"], errors="coerce")
++
++        # Merge in sample metadata if available
++        metadata = st.session_state.get("sample_metadata", {})
++        for gv in grouping_vars:
++            df[gv.name] = df["sample_id"].map(lambda sid: metadata.get(sid, {}).get(gv.name, None))
++
++        rows = df_to_rows(df)
++        result_df = process_ddct(rows, st.session_state["experiment_config"])
++        st.session_state["ddct_results_df"] = result_df
++        st.success("ΔΔCt results computed.")
++
++
++
++run()
+
+--- interface/data_import.py (new file) ---
+diff --git a/interface/data_import.py b/interface/data_import.py
+new file mode 100755
+index 0000000..4a7090e
+--- /dev/null
++++ b/interface/data_import.py
+@@ -0,0 +1,135 @@
++import streamlit as st
++import pandas as pd
++
++from interface.components.excel_dialog import show_excel_import_dialog
++from ddct_pipeline.converters import parse_excel_ct_file, collapse_replicates
++from ddct_pipeline.types import GroupingVariable
++
++
++def run():
++    col_title, col_button = st.columns([8, 1])
++    
++    with col_title:
++        st.title("Excel Ct Data Import")
++
++    # --- Step 1: Upload Excel Files ---
++    with col_button:
++        if st.button("Import Excel"):
++            show_excel_import_dialog()
++
++    uploaded_files = st.session_state.get("uploaded_excel_files", [])
++    if not uploaded_files:
++        st.info("Use the **Import Excel** button to upload files.")
++        return
++
++    all_rows = []
++
++    for file in uploaded_files:
++        try:
++            df = parse_excel_ct_file(file)
++            all_rows.append(df)
++            st.success(f"✅ {file.name}: {len(df)} rows parsed.")
++        except Exception as e:
++            st.error(f"❌ `{file.name}`: {e}")
++
++    if not all_rows:
++        return
++
++    combined = pd.concat(all_rows, ignore_index=True)
++    df_long = collapse_replicates(combined)
++
++    # --- Step 2: Visual Summary Overview ---
++    sample_names = sorted(df_long["Sample ID"].unique())
++    gene_names = sorted(df_long["Gene"].unique())
++    file_names = sorted(set(df_long["Source File"]))
++    with st.expander("📁 Source Files"):
++        st.write(file_names)
++
++    col1, col2 = st.columns(2)
++
++    with col1:
++        st.markdown("**Sample Names**")
++        with st.container(height=100, border=False):
++            st.text(
++                "Check that your sample names are all processed properly. " \
++                "Each sample should have its own sample name. " \
++                "But if you have the same sample loaded across multiple runs for some reason, " \
++                "make sure that they're the same here.")
++        st.dataframe(pd.DataFrame({"Sample ID": sample_names}), use_container_width=True, hide_index=True)
++
++    with col2:
++        st.markdown("**Gene Names**")
++        with st.container(height=100, border=False):
++            st.text(
++                "Same here. Check that the same genes across runs" \
++                "are referring to the same gene.")
++        st.dataframe(pd.DataFrame({"Gene": gene_names}), use_container_width=True, hide_index=True)
++
++    with st.expander("Renaming"):
++        unique_samples = sorted(df_long["Sample ID"].unique())
++        unique_genes = sorted(df_long["Gene"].unique())
++
++        col1, col2 = st.columns(2)
++        with col1:
++            st.markdown("**Rename Samples**")
++            for sid in unique_samples:
++                new_val = st.text_input(f"Sample: `{sid}`", value=sid, key=f"rename_sample_{sid}")
++                if new_val != sid:
++                    df_long["Sample ID"] = df_long["Sample ID"].replace(sid, new_val)
++
++        with col2:
++            st.markdown("**Rename Genes**")
++            for g in unique_genes:
++                new_val = st.text_input(f"Gene: `{g}`", value=g, key=f"rename_gene_{g}")
++                if new_val != g:
++                    df_long["Gene"] = df_long["Gene"].replace(g, new_val)
++
++        # Collapse again if renaming caused duplicates
++        df_long = df_long.groupby(["Sample ID", "Gene"], as_index=False).agg({
++            "Ct": "mean",
++            "Replicates": lambda x: sum(x, []),
++            "n": "sum",
++            "Original Sample ID": "first",
++            "Source File": "first"
++        })
++
++    # --- Step 3: Preview Table ---
++    st.markdown("### Table Preview")
++    st.data_editor(
++        df_long[["Sample ID", "Gene", "n", "Ct", "Replicates", "Source File"]],
++        column_config={
++            "Ct": st.column_config.NumberColumn("Mean Ct", format="%.2f"),
++            "Replicates": st.column_config.ListColumn("Ct Replicates"),
++            "Source File": st.column_config.TextColumn("Source File")
++        },
++        use_container_width=True,
++        hide_index=True,
++        disabled=True
++    )
++
++    # --- Step 4: Optional Renaming ---
++
++
++    # --- Step 5: Finalize + Load ---
++    if st.button("Load into Session", type="primary", use_container_width=True):
++        df_export = df_long[["Sample ID", "Gene", "Ct"]].copy()
++        st.session_state["ct_data_df"] = df_export
++
++        # Inject grouping variable: "Samples"
++        sample_ids = sorted(df_export["Sample ID"].unique())
++        existing = [g.name for g in st.session_state["experiment_config"].get("grouping_variables", [])]
++        if "Sample ID" not in existing:
++            st.session_state["experiment_config"]["grouping_variables"].insert(
++                0, GroupingVariable(name="Samples", values=sample_ids)
++            )
++
++        # Set genes if not already defined
++        if not st.session_state["experiment_config"].get("genes"):
++            st.session_state["experiment_config"]["genes"] = sorted(df_export["Gene"].unique())
++
++        st.toast("Ct data loaded into session.")
++        st.session_state.pop("uploaded_excel_files", None)
++        st.switch_page("interface/quick_wizard.py")
++
++
++run()
+
+--- interface/home.py (new file) ---
+diff --git a/interface/home.py b/interface/home.py
+new file mode 100755
+index 0000000..b54e159
+--- /dev/null
++++ b/interface/home.py
+@@ -0,0 +1,24 @@
++# interface/home.py
++
++import streamlit as st
++
++def run():
++    st.header("Welcome to the ΔΔCt Expression App")
++    st.text("(or whatever i decide to call it)")
++
++    st.markdown(
++        """
++        This app helps you calculate and visualize **gene expression** using the **ΔΔCt method**.
++
++        **Key Features:**
++        - Upload long-form Ct data (e.g., straight from the QuantStudio's exporting software)
++        - Set up genes, reference conditions, and grouping variables
++        - Compute ΔCt, ΔΔCt, and Fold Change with replicates handled properly
++        - Visualize expression changes with interactive bar/box plots
++        - Export results or session state for reuse
++
++        **Next step:** Go to the **Quick Setup** page to begin your analysis.
++        """
++    )
++
++run()
+
+--- interface/plot_viewer.py (new file) ---
+diff --git a/interface/plot_viewer.py b/interface/plot_viewer.py
+new file mode 100755
+index 0000000..ff69dc8
+--- /dev/null
++++ b/interface/plot_viewer.py
+@@ -0,0 +1,203 @@
++import streamlit as st
++import pandas as pd
++import numpy as np
++
++import plotly.graph_objects as go
++from interface.plotting.plot_ddct import build_ddct_plot
++from interface.plotting.utils import render_plot_data_tables
++
++from interface.backend.session_schema import ExperimentConfig
++
++def render_filter(df, label: str, group_name: str):
++    if group_name and group_name != "None":
++        col_name = _normalize_key(group_name)
++        if col_name in df.columns:
++            options = sorted(df[col_name].dropna().unique())
++            return st.multiselect(
++                f"Filter: {label} ({group_name})",
++                options=options,
++                default=options,
++                key=f"filter_{label}_{group_name}"
++            )
++    return []
++
++def _normalize_key(key: str) -> str:
++    return {"Gene": "gene", "Samples": "Samples"}.get(key, key)
++
++
++def _get_config_options(df: pd.DataFrame, config: dict):
++    group_vars = ["Gene"] + list(config.get("groups", {}).keys())
++
++    # Inject 'Samples' manually if not already present
++    if "Samples" not in group_vars and "Samples" in df.columns:
++        group_vars.append("Samples")
++
++    genes = sorted(df["gene"].unique())
++    return genes, group_vars
++
++
++def _plot_controls(genes: list[str], group_vars: list[str]):
++    st.markdown("### Plot Configuration")
++
++    selected_genes = st.multiselect("Target Gene(s)", genes, default=genes)
++    if not selected_genes:
++        st.warning("Please select at least one gene to display.")
++        st.stop()
++
++    # --- Dropdowns for axis roles ---
++    col1, col2, col3 = st.columns(3)
++
++    filters = {}
++    df = st.session_state["ddct_results_df"]
++
++    with col1:
++        x_axis = st.selectbox("X-axis Group", group_vars, index=0)
++        if x_axis:
++            x_filter = render_filter(df, "X-axis Group", x_axis)
++
++    with col2:
++        color_by = st.selectbox("Color By", ["None"] + group_vars, index=0)
++        if color_by:
++            c_filter = render_filter(df, "Color By", color_by)
++
++    with col3:
++        facet_by = st.selectbox("Facet By", ["None"] + group_vars, index=0)
++        if facet_by:
++            f_filter = render_filter(df, "Facet By", facet_by)
++
++    # --- Dynamic filters for each selected group ---
++
++    for k, v in [(x_axis, x_filter), (color_by, c_filter), (facet_by, f_filter)]:
++        k_norm = _normalize_key(k)
++        if k != "None" and v:
++            filters[k_norm] = v
++
++    # --- Plot options ---
++    scale = st.radio("Y-axis Metric", ["ΔΔCt", "Fold Change (2^-ΔΔCt)"], horizontal=True)
++    plot_type = st.radio("Plot Type", ["Bar", "Box"], horizontal=True)
++    hide_ntc = st.checkbox("Hide NTC samples", value=True)
++
++    return {
++        "selected_genes": selected_genes,
++        "group_by": [_normalize_key(x_axis)],
++        "color_by": None if color_by == "None" else _normalize_key(color_by),
++        "facet_col": None if facet_by == "None" else _normalize_key(facet_by),
++        "scale": scale,
++        "hide_ntc": hide_ntc,
++        "plot_type": plot_type,
++        "filters": filters
++    }
++
++
++
++def _has_plot_conflict(opts: dict) -> bool:
++    keys = ["group_by", "color_by", "facet_col", "facet_row"]
++    selected = [tuple(opts[k]) if isinstance(opts[k], list) else opts[k] for k in keys if opts.get(k)]
++    seen = set()
++    for val in selected:
++        if val in seen:
++            return True
++        seen.add(val)
++    return False
++
++def run():
++    st.title("Gene Expression Analysis")
++
++    df: pd.DataFrame = st.session_state.get("ddct_results_df")
++    config: ExperimentConfig = st.session_state.get("experiment_config")
++
++
++    if df is None or config is None or df.empty:
++        st.info("Please input Ct data and configure experiment.")
++        return
++
++    genes, group_vars = _get_config_options(df, config)
++    opts = _plot_controls(genes, group_vars)
++
++    for col, allowed_vals in opts["filters"].items():
++        if col in df.columns:
++            df = df[df[col].isin(allowed_vals)]
++
++    if _has_plot_conflict(opts):
++        st.warning("⚠️ You are using the same variable (e.g. 'Age') for multiple roles. Please adjust your selections.")
++        return
++
++    plot_result = build_ddct_plot(
++        df=df,
++        genes=opts["selected_genes"],
++        group_by=opts["group_by"],
++        y_scale=opts["scale"],
++        kind=opts["plot_type"].lower(),
++        facet_col=opts["facet_col"],
++        facet_row=None,
++        color_by=opts["color_by"],
++        hide_ntc=opts["hide_ntc"]
++    )
++
++    if isinstance(plot_result, list):
++        all_y = np.concatenate([
++            d["plot_value"].values if "plot_value" in d.columns else d["mean"].values
++            for _, d, _ in plot_result
++        ])
++        y_min, y_max = float(np.nanmin(all_y)), float(np.nanmax(all_y))
++        num_plots = len(plot_result)
++
++        base_fig = plot_result[0][0]
++        legend_traces = [
++            go.Bar(
++                x=[None], y=[None],
++                name=trace.name,
++                marker=dict(color=trace.marker.color),
++                showlegend=True
++            )
++            for trace in base_fig.data
++            if trace.name and hasattr(trace, "marker") and getattr(trace.marker, "color", None)
++        ]
++
++        if legend_traces:
++            cols = st.columns([4] * num_plots + [1])
++        else:
++            cols = st.columns(num_plots)
++
++        for idx, (fig, _, _) in enumerate(plot_result):
++            fig.update_layout(
++                yaxis=dict(
++                    range=[y_min, y_max],
++                    showticklabels=(idx == 0),
++                    title_text="Fold Change" if idx == 0 else None
++                ),
++                showlegend=False
++            )
++            fig.update_xaxes(tickangle=0)
++            with cols[idx]:
++                st.plotly_chart(fig, use_container_width=True)
++
++        if legend_traces:
++            legend_fig = go.Figure(data=legend_traces)
++            legend_fig.update_layout(
++                showlegend=True,
++                legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=0.0),
++                height=300,
++                margin=dict(l=0, r=0, t=10, b=10),
++                xaxis_visible=False,
++                yaxis_visible=False
++            )
++            with cols[-1]:
++                st.plotly_chart(legend_fig, use_container_width=True)
++
++        plot_df = next(
++            (d for _, d, _ in plot_result if "_x_label" in d.columns and "plot_value" in d.columns),
++            None
++        )
++
++    else:
++        fig, summary, plot_df = plot_result
++        st.plotly_chart(fig, use_container_width=True)
++
++    if plot_df is not None:
++        render_plot_data_tables(plot_df, plot_result, opts)
++    else:
++        st.warning("Could not display raw data — plotting frame missing or invalid.")
++
++
++run()
+\ No newline at end of file
+
+--- interface/plotting/__init__.py (new file) ---
+diff --git a/interface/plotting/__init__.py b/interface/plotting/__init__.py
+new file mode 100755
+index 0000000..73f69e0
+--- /dev/null
++++ b/interface/plotting/__init__.py
+@@ -0,0 +1 @@
++# interface/plotting/__init__.py
+\ No newline at end of file
+
+--- interface/plotting/plot_ddct.py (new file) ---
+diff --git a/interface/plotting/plot_ddct.py b/interface/plotting/plot_ddct.py
+new file mode 100755
+index 0000000..6f2da6f
+--- /dev/null
++++ b/interface/plotting/plot_ddct.py
+@@ -0,0 +1,212 @@
++# interface/plotting/plot_ddct.py
++
++import pandas as pd
++import numpy as np
++import plotly.express as px
++import plotly.graph_objects as go
++from plotly.graph_objects import Figure
++from typing import Optional, Tuple, Literal, Union, List
++
++
++def build_ddct_plot(
++    df: pd.DataFrame,
++    genes: list[str],
++    group_by: list[str],
++    y_scale: Literal["ΔΔCt", "Fold Change", "log2FoldChange"] = "Fold Change",
++    kind: Literal["box", "bar"] = "box",
++    facet_col: Optional[str] = None,
++    facet_row: Optional[str] = None,
++    color_by: Optional[str] = None,
++    hide_ntc: bool = False
++) -> Union[Tuple[Figure, pd.DataFrame, pd.DataFrame], List[Tuple[Figure, pd.DataFrame, str]]]:
++
++    df = _filter_genes(df, genes)
++    if hide_ntc:
++        df = _filter_ntc(df)
++
++    df["plot_value"], ylabel = _get_plot_values(df, y_scale)
++    df["_x_label"] = _build_x_label(df, group_by)
++
++    group_keys = [color_by, facet_col, facet_row]
++    group_keys = [k for k in group_keys if k]
++
++    summary = _summarize_groups(df, group_keys)
++    summary = summary[(summary["mean"].notna()) & (summary["count"] > 0)]
++
++    if kind == "bar" and (facet_row or facet_col):
++        return _split_barplots(summary, df, genes, y_scale, ylabel, color_by, facet_col, facet_row)
++    if kind == "box" and (facet_row or facet_col):
++        return _split_boxplots(df, genes, y_scale, ylabel, color_by, facet_col, facet_row)
++
++    return _single_plot(df, summary, kind, genes, y_scale, ylabel, color_by, facet_col, facet_row)
++
++
++# --- Plot paths ---
++
++def _single_plot(
++    df: pd.DataFrame,
++    summary: pd.DataFrame,
++    kind: str,
++    genes: list[str],
++    y_scale: str,
++    ylabel: str,
++    color_by: Optional[str],
++    facet_col: Optional[str],
++    facet_row: Optional[str]
++) -> Tuple[Figure, pd.DataFrame, pd.DataFrame]:
++
++    category_orders = {"_x_label": sorted(summary["_x_label"].unique())}
++
++    if kind == "bar":
++        fig = px.bar(
++            summary,
++            x="_x_label",
++            y="mean",
++            error_y="sem",
++            color=color_by if color_by in summary.columns else None,
++            facet_col=facet_col,
++            facet_row=facet_row,
++            labels={"_x_label": "", "mean": ylabel, "sem": "SEM"},
++            category_orders=category_orders
++        )
++        fig.update_layout(barmode="group")
++    else:
++        fig = px.box(
++            df,
++            x="_x_label",
++            y="plot_value",
++            points="all",
++            color=color_by,
++            facet_col=facet_col,
++            facet_row=facet_row,
++            labels={"_x_label": "", "plot_value": ylabel},
++            category_orders=category_orders
++        )
++
++    fig.update_layout(margin=dict(t=40, b=40))
++    fig.update_xaxes(tickangle=0)
++    return fig, summary, df
++
++
++def _split_barplots(
++    summary: pd.DataFrame,
++    raw_df: pd.DataFrame,
++    genes: list[str],
++    y_scale: str,
++    ylabel: str,
++    color_by: Optional[str],
++    facet_col: Optional[str],
++    facet_row: Optional[str]
++) -> List[Tuple[Figure, pd.DataFrame, str]]:
++    facet_keys = [k for k in [facet_row, facet_col] if k]
++    figures = []
++
++    for facet_vals, subset in summary.groupby(facet_keys):
++        facet_vals = (facet_vals,) if isinstance(facet_vals, str) else facet_vals
++        label = ", ".join(f"{k}={v}" for k, v in zip(facet_keys, facet_vals))
++
++        # Match raw data subset
++        raw_subset = raw_df.copy()
++        for k, v in zip(facet_keys, facet_vals):
++            raw_subset = raw_subset[raw_subset[k] == v]
++
++        fig = px.bar(
++            subset,
++            x="_x_label",
++            y="mean",
++            error_y="sem",
++            color=color_by if color_by in subset.columns else None,
++            labels={"_x_label": "", "mean": ylabel, "sem": "SEM"},
++            category_orders={"_x_label": sorted(subset["_x_label"].unique())}
++        )
++        fig.update_layout(barmode="group", height=400)
++        fig.update_xaxes(tickangle=0, automargin=True)
++        figures.append((fig, raw_subset, label))
++
++    return figures
++
++
++def _split_boxplots(
++    df: pd.DataFrame,
++    genes: list[str],
++    y_scale: str,
++    ylabel: str,
++    color_by: Optional[str],
++    facet_col: Optional[str],
++    facet_row: Optional[str]
++) -> List[Tuple[Figure, pd.DataFrame, str]]:
++    facet_keys = [k for k in [facet_row, facet_col] if k]
++    figures = []
++
++    for facet_vals, subset in df.groupby(facet_keys):
++        facet_vals = (facet_vals,) if isinstance(facet_vals, str) else facet_vals
++        label = ", ".join(f"{k}={v}" for k, v in zip(facet_keys, facet_vals))
++
++        fig = px.box(
++            subset,
++            x="_x_label",
++            y="plot_value",
++            points="all",
++            color=color_by if color_by in subset.columns else None,
++            labels={"_x_label": "", "plot_value": ylabel},
++            category_orders={"_x_label": sorted(subset["_x_label"].unique())}
++        )
++        fig.update_layout(height=400)
++        fig.update_xaxes(tickangle=0, automargin=True)
++        figures.append((fig, subset, label))
++
++    return figures
++
++
++# --- Helpers ---
++
++def _filter_genes(df: pd.DataFrame, genes: list[str]) -> pd.DataFrame:
++    return df[df["gene"].isin(genes)].copy()
++
++
++def _filter_ntc(df: pd.DataFrame) -> pd.DataFrame:
++    if "sample_id" not in df.columns and "Sample ID" in df.columns:
++        df = df.rename(columns={"Sample ID": "sample_id"})
++    return df[~df["sample_id"].str.contains(r"\bntc\b", case=False, na=False)]
++
++
++def _get_plot_values(df: pd.DataFrame, y_scale: str) -> Tuple[pd.Series, str]:
++    scale = y_scale.casefold()
++
++    if scale in {"ddct", "δδct", "ΔΔct".casefold()}:
++        if "ΔΔCt" not in df.columns or df["ΔΔCt"].isna().all():
++            raise ValueError("ΔΔCt values not available. Ensure reference condition is set and ΔΔCt analysis was run.")
++        return df["ΔΔCt"], "ΔΔCt"
++
++    if scale in {"log2foldchange", "log₂(fold change)"}:
++        if "Fold Change" not in df.columns:
++            raise ValueError("Fold Change values not available. Run ΔΔCt processing first.")
++        return np.log2(df["Fold Change"].replace(0, np.nan)), "log₂(Fold Change)"
++
++    if "Fold Change" not in df.columns:
++        raise ValueError("Fold Change values not available. Run ΔΔCt processing first.")
++    return df["Fold Change"], "Fold Change (2^-ΔΔCt)"
++
++
++def _build_x_label(df: pd.DataFrame, group_by: list[str]) -> pd.Series:
++    group_by = ["gene" if g == "Gene" else g for g in group_by]
++    return df[group_by].astype(str).agg("_".join, axis=1) if len(group_by) > 1 else df[group_by[0]].astype(str)
++
++
++def _summarize_groups(df: pd.DataFrame, extra_group_cols: list[str]) -> pd.DataFrame:
++    group_cols = ["_x_label"] + [col for col in extra_group_cols if col in df.columns]
++
++    rename_map = {}
++    safe_df = df.copy()
++    for col in group_cols:
++        if col in safe_df.columns and col in safe_df.index.names:
++            new_col = f"{col}_grp"
++            rename_map[col] = new_col
++            safe_df = safe_df.rename(columns={col: new_col})
++            group_cols = [rename_map.get(c, c) for c in group_cols]
++
++    grouped = safe_df.groupby(group_cols)["plot_value"]
++    summary = grouped.agg(mean="mean", std="std", count="count").reset_index()
++    summary["sem"] = summary["std"] / summary["count"] ** 0.5
++
++    return summary.rename(columns={v: k for k, v in rename_map.items()})
+
+--- interface/plotting/utils.py (new file) ---
+diff --git a/interface/plotting/utils.py b/interface/plotting/utils.py
+new file mode 100755
+index 0000000..29230bf
+--- /dev/null
++++ b/interface/plotting/utils.py
+@@ -0,0 +1,66 @@
++# interface/plotting/utils.py
++
++import streamlit as st
++import pandas as pd
++from typing import List, Tuple, Union
++
++def render_plot_data_tables(
++    df: pd.DataFrame,
++    plot_result: Union[List[Tuple], Tuple],
++    opts: dict
++):
++    with st.expander("Show Raw Plot Values"):
++        if df is None:
++            st.warning("Could not display raw data — no DataFrame provided.")
++            return
++
++        # Dynamically detect key columns
++        x_label_col = next((c for c in df.columns if c.lower() in {"_x_label", "x_label"}), None)
++        y_value_col = next((c for c in df.columns if c.lower() in {"plot_value", "ΔΔct", "fold change", "log₂(fold change)"}), None)
++
++        if x_label_col is None or y_value_col is None:
++            st.warning("Required columns for plotting not found (e.g., _x_label, plot_value).")
++            return
++
++        if isinstance(plot_result, list):  # Faceted
++            for fig, facet_df, label in plot_result:
++                _render_facet_table(facet_df, label, opts, x_label_col, y_value_col)
++        else:
++            fig, summary_df, full_df = plot_result
++            _render_facet_table(full_df, "All Data", opts, x_label_col, y_value_col)
++
++
++def _render_facet_table(
++    df: pd.DataFrame,
++    label: str,
++    opts: dict,
++    x_label_col: str,
++    y_value_col: str
++):
++    try:
++        sample_col = "sample_id" if "sample_id" in df.columns else "Sample ID"
++        group_cols = [opts.get("color_by")] + opts.get("group_by", [])
++        group_cols = [c for c in group_cols if c and c in df.columns]
++
++        stats_cols = ["mean", "std", "sem", "count"]
++        all_cols = [x_label_col, sample_col, "gene", y_value_col] + stats_cols + group_cols
++        cols_to_show = [col for col in dict.fromkeys(all_cols) if col in df.columns]
++
++        df_display = df[cols_to_show].copy().sort_values(by=x_label_col)
++
++        # Rename _x_label to something meaningful
++        if x_label_col == "_x_label":
++            group_label = opts["group_by"]
++            label_str = " + ".join(group_label) if isinstance(group_label, list) else group_label
++            df_display = df_display.rename(columns={x_label_col: f"Group: {label_str}"})
++        elif x_label_col:
++            df_display = df_display.rename(columns={x_label_col: "Group"})
++
++        st.markdown(f"**Facet: `{label}`**")
++        if not df_display.empty:
++            st.dataframe(df_display, use_container_width=True)
++        else:
++            st.caption("*(empty)*")
++
++    except Exception as e:
++        st.error(f"Error rendering table for facet '{label}': {e}")
+
+--- interface/quick_wizard.py (new file) ---
+diff --git a/interface/quick_wizard.py b/interface/quick_wizard.py
+new file mode 100755
+index 0000000..48a22db
+--- /dev/null
++++ b/interface/quick_wizard.py
+@@ -0,0 +1,302 @@
++import streamlit as st
++import pandas as pd
++from ddct_pipeline.converters import df_to_rows
++from ddct_pipeline.processor import process_ddct
++from ddct_pipeline.types import GroupingVariable
++from interface.components.excel_dialog import show_excel_import_dialog
++
++# --- Dialogs ---
++@st.dialog("Add Grouping Variable")
++def manual_grouping_dialog():
++    with st.form("grouping_form"):
++        group_name = st.text_input("Grouping Variable Name", placeholder="e.g., Sex")
++        values_str = st.text_area("Values (one line each)", placeholder="e.g.,\nmale\nfemale")
++        if st.form_submit_button("Add Grouping"):
++            if not group_name or not values_str:
++                st.warning("Both name and values are required.")
++                return
++
++            values = [v.strip() for v in values_str.splitlines() if v.strip()]
++            if group_name != "Samples":
++                values = ["N/A"] + [v for v in values if v != "N/A"]
++
++            new_row = {"Grouping Name": group_name, "Values": values, "Delete?": False}
++            df = st.session_state.get("custom_group_df", pd.DataFrame(columns=["Delete?", "Grouping Name", "Values"]))
++            updated_df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
++            st.session_state["custom_group_df"] = updated_df
++            st.rerun()
++
++# --- Step 1: Upload + Genes ---
++def step_upload_and_genes():
++    if st.button("Upload Files", use_container_width=True):
++        show_excel_import_dialog()
++        return False
++
++    df = st.session_state.get("ct_data_df")
++    if df is None or df.empty:
++        st.info("No Ct data loaded.")
++        return False
++
++    genes = sorted(df["Gene"].unique())
++    st.session_state.setdefault("experiment_config", {})
++    st.session_state["experiment_config"]["genes"] = genes
++
++    sample_count = df["Sample ID"].nunique()
++    st.success(f"Detected {len(genes)} unique genes and {sample_count} samples.")
++    return True
++
++# --- Step 2: Grouping Variables ---
++def step_grouping_variables():
++    st.button("Add Variable", icon=":material/add_circle_outline:", on_click=manual_grouping_dialog, use_container_width=True)
++
++    df = st.session_state.get("custom_group_df", pd.DataFrame(columns=["Delete?", "Grouping Name", "Values"]))
++    ct_df = st.session_state.get("ct_data_df")
++
++    if ct_df is not None and not ct_df.empty:
++        sample_ids = sorted(ct_df["Sample ID"].unique())
++        sample_row = {"Grouping Name": "Samples", "Values": sample_ids, "Delete?": False}
++        if not (df["Grouping Name"] == "Samples").any():
++            df = pd.concat([pd.DataFrame([sample_row]), df], ignore_index=True)
++
++    if "Delete?" not in df.columns:
++        df["Delete?"] = False
++
++    df = df[["Delete?", "Grouping Name", "Values"]]
++    edited_df = st.data_editor(
++        df,
++        column_config={
++            "Delete?": st.column_config.CheckboxColumn("Delete"),
++            "Grouping Name": st.column_config.TextColumn("Variable"),
++            "Values": st.column_config.ListColumn("Values"),
++        },
++        use_container_width=True,
++        hide_index=True,
++        key="group_editor"
++    )
++
++    prev_state = st.session_state.get("prev_checkbox_state", [])
++    current_state = edited_df["Delete?"].tolist()
++    to_keep = ~edited_df.index.isin(edited_df[edited_df["Delete?"]].index) | (edited_df["Grouping Name"] == "Samples")
++    filtered_df = edited_df[to_keep].copy()
++    st.session_state["custom_group_df"] = filtered_df
++    st.session_state["prev_checkbox_state"] = current_state
++    if prev_state != current_state:
++        st.rerun()
++
++    if not filtered_df.empty:
++        group_vars = []
++        group_dict = {}
++        for _, row in filtered_df.iterrows():
++            name = row["Grouping Name"]
++            raw_values = row["Values"]
++            values = raw_values if name == "Samples" else (["N/A"] + [v for v in raw_values if v != "N/A"])
++            group_vars.append(GroupingVariable(name=name, values=values))
++            group_dict[name] = values
++
++        st.session_state["experiment_config"]["grouping_variables"] = group_vars
++        st.session_state["experiment_config"]["groups"] = group_dict
++        st.session_state["experiment_config"]["reference_grouping"] = group_vars[0].name
++
++# --- Step 3: Reference Genes ---
++def step_reference_genes():
++    genes = st.session_state["experiment_config"].get("genes", [])
++    default_refs = st.session_state["experiment_config"].get("reference_genes", [])
++    selected = st.multiselect("Select reference gene(s)", options=genes, default=default_refs)
++    st.session_state["experiment_config"]["reference_genes"] = selected
++
++# --- Step 4: Reference Condition ---
++def step_reference_condition():
++    grouping_names = [g.name for g in st.session_state["experiment_config"].get("grouping_variables", [])]
++    if not grouping_names:
++        st.warning("Please define at least one grouping variable.")
++        return
++
++    ref_grouping = st.selectbox("Select grouping variable for reference", options=grouping_names)
++    st.session_state["experiment_config"]["reference_grouping"] = ref_grouping
++    possible_values = st.session_state["experiment_config"]["groups"].get(ref_grouping, [])
++    ref_cond = st.selectbox("Select reference condition", options=possible_values)
++    st.session_state["experiment_config"]["reference_condition"] = ref_cond
++
++# --- Step 5: Assign Metadata ---
++def step_assign_metadata():
++    df = st.session_state.get("ct_data_df")
++    grouping_vars = st.session_state["experiment_config"].get("grouping_variables", [])
++
++    if df is None or df.empty or not grouping_vars:
++        return
++
++    sample_genes = df.groupby("Sample ID")["Gene"].unique().apply(list)
++    rows = []
++
++    for sample_id, genes in sample_genes.items():
++        row = {"Sample ID": sample_id, "Genes": list(genes)}
++        for gv in grouping_vars:
++            if gv.name == "Samples":
++                row[gv.name] = sample_id
++            else:
++                row[gv.name] = st.session_state.get("sample_metadata", {}).get(sample_id, {}).get(gv.name, "")
++        rows.append(row)
++
++    editor_df = pd.DataFrame(rows)
++
++    column_config = {
++        "Genes": st.column_config.ListColumn(label="Genes"),
++    }
++    for gv in grouping_vars:
++        if gv.name == "Samples":
++            continue
++        column_config[gv.name] = st.column_config.SelectboxColumn(label=gv.name, options=gv.values, required=True)
++
++    edited = st.data_editor(
++        editor_df,
++        use_container_width=True,
++        column_config=column_config,
++        column_order=["Sample ID", "Genes"] + [g.name for g in grouping_vars if g.name != "Samples"],
++        disabled=["Sample ID", "Genes"],
++        hide_index=True,
++        key="quick_meta_editor"
++    )
++
++    if st.button("💾 Save Metadata", use_container_width=True):
++        sample_meta = {}
++        for _, row in edited.iterrows():
++            sid = row["Sample ID"]
++            sample_meta[sid] = {gv.name: row[gv.name] for gv in grouping_vars}
++        st.session_state["sample_metadata"] = sample_meta
++        st.toast("Sample metadata saved!", icon="✅")
++
++
++# --- Step 6: Run Analysis ---
++def step_run_analysis():
++    if st.button("Run Analysis", type="primary", use_container_width=True):
++        df_copy = st.session_state["ct_data_df"].copy()
++        df_copy = df_copy.rename(columns={"Sample ID": "sample_id", "Gene": "gene", "Ct": "ct"})
++        df_copy["ct"] = pd.to_numeric(df_copy["ct"], errors="coerce")
++
++        metadata = st.session_state.get("sample_metadata", {})
++        for gv in st.session_state["experiment_config"].get("grouping_variables", []):
++            df_copy[gv.name] = df_copy["sample_id"].map(lambda sid: metadata.get(sid, {}).get(gv.name, sid if gv.name == "Samples" else None))
++
++        rows = df_to_rows(df_copy)
++        result = process_ddct(rows, st.session_state["experiment_config"])
++        st.session_state["ddct_results_df"] = result
++        st.success("∆∆Ct analysis complete.")
++        st.page_link("interface/plot_viewer.py", label="→ Go to Plots", icon="📊", use_container_width=True)
++
++
++# --- Main Entrypoint ---
++def run():
++    st.title("Quick Setup Wizard")
++
++    if st.session_state.get("excel_upload_complete"):
++        st.session_state.pop("excel_upload_complete")
++        st.switch_page("interface/data_import.py")
++        return
++
++    col1, col2, col3, col4 = st.columns([2, 3, 2, 2])
++
++    with col1:
++        st.subheader("Step 1.")
++        st.text("Upload exported Excel file.")
++        ct_loaded = step_upload_and_genes()
++    if not ct_loaded:
++        st.info("Once data is loaded, the next steps will appear.")
++        return
++
++    with col2:
++        st.subheader("Step 2.")
++        st.text("Define variables for grouping samples.")
++        step_grouping_variables()
++
++    with col3:
++        st.subheader("Step 3.")
++        st.text("Define reference gene(s).")
++        step_reference_genes()
++
++    with col4:
++        st.subheader("Step 4.")
++        st.text("Define baseline/reference condition.")
++        step_reference_condition()
++
++    st.subheader("Step 5.")
++    st.text("Assign Sample Metadata")
++    step_assign_metadata()
++
++
++    # --- Optional: Experiment Summary ---
++    config = st.session_state.get("experiment_config", {})
++    genes = config.get("genes", [])
++    ref_genes = config.get("reference_genes", [])
++    grouping_vars = config.get("grouping_variables", [])
++    ref_group = config.get("reference_grouping")
++    ref_condition = config.get("reference_condition")
++
++
++    grouping_details = {
++        gv.name: gv.values for gv in config.get("grouping_variables", [])
++    }
++    sample_count = st.session_state["ct_data_df"]["Sample ID"].nunique()
++
++
++    # --- Validation state ---
++    is_ready = all([
++        len(genes) >= 2,
++        len(ref_genes) >= 1,
++        any(g not in ref_genes for g in genes),
++        grouping_vars,
++        ref_group,
++        ref_condition,
++        len(config.get("groups", {}).get(ref_group, [])) >= 2
++    ])
++
++    if is_ready:
++        target_genes = [g for g in genes if g not in ref_genes]
++        other_conditions = [v for v in config["groups"].get(ref_group, []) if v != ref_condition]
++
++        ref_gene_str = ", ".join(ref_genes)
++        target_gene_str = ", ".join(target_genes)
++        sample_count = st.session_state["ct_data_df"]["Sample ID"].nunique()
++
++        grouping_var_sentences = []
++        for gv in grouping_vars:
++            vals = ", ".join(gv.values)
++            grouping_var_sentences.append(f"{gv.name} ({vals})")
++        grouping_description = "; ".join(grouping_var_sentences)
++
++        methods_paragraph = (
++            f"Gene expression analysis was performed on **{sample_count} samples** across **{len(genes)} targets** "
++            f"(**{target_gene_str}**, normalized to **{ref_gene_str}**) using the ΔΔCt method. "
++            f"Samples were grouped by **{ref_group}**, with **{ref_condition}** defined as the reference condition "
++            f"and comparisons made against other conditions including {', '.join(other_conditions)}.  \n\n"
++            f"Experimental grouping variables included: {grouping_description}."
++        )
++
++        st.markdown("### Methods Summary")
++        st.markdown(methods_paragraph)
++
++        st.subheader("Step 6:")
++        st.text("Run ∆∆Ct Analysis (finally).")
++        step_run_analysis()
++    else:
++        st.info("⚠️ You're almost there! The following are required before you can run analysis:")
++
++        missing = []
++        if len(genes) < 2:
++            missing.append("• At least **2 genes** must be defined.")
++        if len(ref_genes) < 1:
++            missing.append("• Select at least **1 reference gene**.")
++        if all(g in ref_genes for g in genes):
++            missing.append("• Add at least **1 non-reference gene**.")
++        if not grouping_vars:
++            missing.append("• Define at least **1 grouping variable**.")
++        if not ref_group:
++            missing.append("• Select a **reference grouping variable**.")
++        if not ref_condition:
++            missing.append("• Choose a **reference condition** for the selected grouping.")
++        elif len(config.get("groups", {}).get(ref_group, [])) < 2:
++            missing.append("• The selected grouping must have at least **2 conditions**.")
++
++        for item in missing:
++            st.markdown(item)
++
++run()
+
+--- interface/setup_experiment.py (new file) ---
+diff --git a/interface/setup_experiment.py b/interface/setup_experiment.py
+new file mode 100755
+index 0000000..ca9e05a
+--- /dev/null
++++ b/interface/setup_experiment.py
+@@ -0,0 +1,210 @@
++# interface/setup_experiment.py
++
++import streamlit as st
++from ddct_pipeline.types import GroupingVariable
++from interface.components.excel_dialog import show_excel_import_dialog
++
++from interface.backend.session_schema import ExperimentConfig
++
++# --- DIALOGS ---
++
++@st.dialog("Add target gene")
++def add_named_gene_modal():
++    new_name = st.text_input("Gene name", placeholder="e.g. β-actin")
++    if st.button("Add"):
++        st.session_state.experiment_config["genes"].append(new_name)
++        st.rerun()
++
++@st.dialog("Add grouping variable")
++def add_named_variable_modal():
++
++    new_name = st.text_input("Variable name", placeholder="e.g. condition, tissue")
++    if st.button("Add"):
++        st.session_state.experiment_config["grouping_variables"].append(GroupingVariable(name=new_name, values=["N/A",]))
++        st.rerun()
++
++@st.dialog("Reset all config?", width="small")
++def clear_all_config_dialog():
++    st.error("This cannot be undone.")
++    if st.button("Confirm Reset", use_container_width=True):
++        st.session_state.experiment_config = {
++            "genes": [],
++            "reference_genes": [],
++            "grouping_variables": [],
++            "reference_condition": "",
++            "groups": {}
++        }
++        st.rerun()
++
++# --- HELPERS ---
++
++def add_value_to_group(index: int):
++    key = f"new_value_{index}"
++    value = st.session_state.get(key, "").strip()
++    if not value:
++        return
++    group_var = st.session_state.experiment_config["grouping_variables"][index]
++    if value not in group_var.values:
++        group_var.values.append(value)
++    st.session_state.experiment_config["groups"][group_var.name] = group_var.values
++    st.session_state[key] = ""
++
++def render_grouping_variable(var: GroupingVariable, index: int):
++    with st.expander(f"{var.name}", expanded=True):
++        col_add, col_del = st.columns([8, 2])
++
++        with col_add:
++            st.text_input(
++                label="Add category",
++                key=f"new_value_{index}",
++                placeholder="e.g. Treated, Control",
++                label_visibility="collapsed",
++                on_change=lambda i=index: add_value_to_group(i)
++            )
++
++        with col_del:
++            if st.button("", icon=":material/clear:", key=f"del_group_{index}", type="primary", use_container_width=True):
++                del st.session_state.experiment_config["grouping_variables"][index]
++                st.rerun()
++
++        selected = st.pills("Values", options=var.values, selection_mode="single", key=f"sel_{index}")
++        if selected:
++            var.values.remove(selected)
++            st.session_state.experiment_config["groups"][var.name] = var.values
++            st.rerun()
++
++def run():
++    st.title("Experiment Setup")
++
++    config: ExperimentConfig = st.session_state.experiment_config
++
++
++
++    col1, col2 = st.columns(2)
++
++    # --- Gene Targets ---
++    with col1:
++        st.subheader("qPCR Target Genes")
++        for i, gene in enumerate(config["genes"]):
++            cols = st.columns([6, 1])
++            cols[0].text_input(f"Gene {i+1}", value=gene, key=f"gene_{i}", disabled=True, label_visibility="collapsed")
++            if cols[1].button("", icon=":material/delete:", key=f"del_gene_{i}", use_container_width=True):
++                config["genes"].pop(i)
++                if gene in config.get("reference_genes", []):
++                    config["reference_genes"].remove(gene)
++                st.rerun()
++
++        st.button("Add Gene", icon=":material/add_circle_outline:", on_click=add_named_gene_modal)
++
++    # --- Grouping Variables ---
++    with col2:
++        st.subheader("Experimental Variables")
++        for i, var in enumerate(config["grouping_variables"]):
++            render_grouping_variable(var, i)
++
++        st.button("Add Grouping Variable", icon=":material/add_circle_outline:", on_click=add_named_variable_modal)
++
++    # --- Reference Genes & Condition ---
++    st.divider()
++
++    st.subheader("Reference gene and reference condition")
++    col_ref_genes, col_ref_condition = st.columns(2)
++
++    with col_ref_genes:
++        config["reference_genes"] = st.multiselect(
++            "Reference Genes",
++            options=config["genes"],
++            default=config.get("reference_genes", [])
++        )
++
++    with col_ref_condition:
++        if config["grouping_variables"]:
++
++            grouping_names = ["Sample ID"] + [g.name for g in config["grouping_variables"]]
++
++            # Ensure reference_grouping is initialized
++            if not config.get("reference_grouping") and grouping_names:
++                config["reference_grouping"] = grouping_names[0]
++
++            config["reference_grouping"] = st.selectbox(
++                "Grouping variable to normalize against",
++                options=grouping_names,
++                index=grouping_names.index(config["reference_grouping"]) if config["reference_grouping"] in grouping_names else 0
++            )
++
++            reference_grouping = config.get("reference_grouping")
++            selected_group = next(
++                (g for g in config["grouping_variables"] if g.name == reference_grouping),
++                None
++            )
++
++            if reference_grouping == "Sample ID":
++                df = st.session_state.get("ct_data_df")
++                if df is not None and not df.empty:
++                    sample_ids = sorted(df["Sample ID"].unique().tolist())
++                    config["reference_condition"] = st.selectbox(
++                        "Reference Sample",
++                        options=sample_ids,
++                        index=sample_ids.index(config["reference_condition"])
++                        if config["reference_condition"] in sample_ids else 0
++                    )
++                else:
++                    st.warning("No Ct data available to populate Sample IDs.")
++            elif selected_group and selected_group.values:
++                group_values = selected_group.values
++                config["reference_condition"] = st.selectbox(
++                    "Reference condition",
++                    options=group_values,
++                    index=group_values.index(config["reference_condition"])
++                    if config["reference_condition"] in group_values else 0
++                )
++            else:
++                st.warning("Define values for the selected grouping variable.")
++
++                st.warning("Define values for the selected grouping variable.")
++
++
++
++    # --- Validation Checklist ---
++    with st.expander("Analysis Checklist"):
++        genes_ok = len(config["genes"]) >= 2
++        refs_ok = len(config.get("reference_genes", [])) >= 1
++        ref_not_only = any(g not in config["reference_genes"] for g in config["genes"])
++        groupvars_ok = len(config.get("grouping_variables", [])) >= 1
++
++        selected_group = next(
++            (g for g in config["grouping_variables"] if g.name == config.get("reference_grouping")), None
++        )
++        group_vals_ok = selected_group and len(selected_group.values) >= 2
++
++        st.checkbox("At least 2 genes defined", value=genes_ok, disabled=True)
++        st.checkbox("At least 1 reference gene selected", value=refs_ok, disabled=True)
++        st.checkbox("At least 1 non-reference gene", value=ref_not_only, disabled=True)
++        st.checkbox("At least 1 grouping variable", value=groupvars_ok, disabled=True)
++        st.checkbox("Selected grouping variable has ≥ 2 values", value=group_vals_ok, disabled=True)
++
++        if all([genes_ok, refs_ok, ref_not_only, groupvars_ok, group_vals_ok]):
++            st.success("Setup looks good!")
++
++            # Dynamic summary
++            ref_gene_str = ", ".join(config["reference_genes"])
++            target_genes = [g for g in config["genes"] if g not in config["reference_genes"]]
++            target_gene_str = ", ".join(target_genes)
++            group_name = config["reference_grouping"]
++            ref_condition = config["reference_condition"]
++            other_conditions = [v for v in selected_group.values if v != ref_condition]
++
++            if group_name and ref_condition and other_conditions:
++                st.markdown(
++                    f"""This experiment compares **{target_gene_str}** expression across **{group_name}** groups  
++                    (e.g. {", ".join(other_conditions)}) normalized to **{ref_gene_str}**, using **{ref_condition}** as the reference condition."""
++                )
++        else:
++            st.info("Complete all required items before analysis.")
++
++
++    #if st.button("Reset All Config", type="primary", use_container_width=True):
++    #    clear_all_config_dialog()
++
++
++run()
+
+--- streamlit_app.py (new file) ---
+diff --git a/streamlit_app.py b/streamlit_app.py
+new file mode 100755
+index 0000000..8823018
+--- /dev/null
++++ b/streamlit_app.py
+@@ -0,0 +1,69 @@
++import streamlit as st
++
++from interface.backend.session import initialize_session_state
++
++st.set_page_config(page_title="ΔΔCt Calculator", layout="wide")
++
++__VERSION__="1.0.0"
++__COMMENT__="works?"
++
++from interface.backend.session_io import (
++    session_export_button,
++    session_import_button,
++    session_restart_button
++)
++
++def main():
++    initialize_session_state()
++
++    custom_pages = {"Analysis Tools": [], "Manual Analysis Tools": []}
++
++    custom_pages["Analysis Tools"].append(
++        st.Page("interface/home.py", title="Home", icon=":material/info:")
++    )
++
++    custom_pages["Analysis Tools"].append(
++        st.Page("interface/quick_wizard.py", title="Quick Setup", icon=":material/bolt:")
++    )
++
++    custom_pages["Analysis Tools"].append(
++        st.Page("interface/plot_viewer.py", title="Plotting", icon=":material/file_present:")
++    )
++
++    custom_pages["Manual Analysis Tools"].append(
++        st.Page("interface/data_import.py", title="Excel Import", icon=":material/file_present:")
++    )
++
++    custom_pages["Manual Analysis Tools"].append(
++        st.Page("interface/setup_experiment.py", title="Experiment Setup", icon=":material/file_present:")
++    )
++
++    custom_pages["Manual Analysis Tools"].append(
++        st.Page("interface/data_entry.py", title="Data Entry", icon=":material/file_present:")
++    )
++
++
++
++    page = st.navigation(custom_pages)
++    page.run()
++
++    st.divider()
++
++    with st.sidebar:
++        st.caption("Session Options")
++        col_import, col_export, col_del = st.columns([3, 3, 1])
++
++        with col_import:
++            session_import_button()
++
++        with col_export:
++            session_export_button()
++
++        with col_del:
++            session_restart_button()
++
++    st.divider()
++    st.caption(f"[qpcr-analysis v {__VERSION__}{': ' + __COMMENT__ if __COMMENT__ else ''}](https://github.com/ericksamera/fla-analysis) | Developed by Erick Samera ([@ericksamera](https://github.com/ericksamera))")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
